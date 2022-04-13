@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-##!/home/e42/dev/py3_envs/udi-lifx-poly-venv/bin/python
 """
 LiFX NodeServer for UDI Polyglot v2
 by Einstein.42 (James Milne) milne.james@gmail.com
 """
 
-import polyinterface
+import udi_interface
 import time
 import sys
 import lifxlan
@@ -17,7 +16,8 @@ from pathlib import Path
 import math
 
 
-LOGGER = polyinterface.LOGGER
+LOGGER = udi_interface.LOGGER
+Custom = udi_interface.Custom
 BR_INCREMENT = 2620    # this is ~4% of 65535
 BR_MIN = 1310          # minimum brightness value ~2%
 BR_MAX = 65535         # maximum brightness value
@@ -51,9 +51,11 @@ COLORS = {
 }
 
 
-class Controller(polyinterface.Controller):
-    def __init__(self, polyglot):
-        super().__init__(polyglot)
+class Controller(udi_interface.Node):
+    def __init__(self, polyglot, primary, address, name):
+        super().__init__(polyglot, primary, address, name)
+        self.parameters = Custom(polyglot, 'customparams')
+        self.cust_data = Custom(polyglot, 'customdata')
         self.lifxLan = None
         self.name = 'LiFX Controller'
         self.discovery_thread = None
@@ -61,59 +63,49 @@ class Controller(polyinterface.Controller):
         self.change_pon = True
         self.ignore_second_on = False
         self.bulbs_found = 0
+        self.poly.subscribe(polyglot.START, self.start, address)
+        self.poly.subscribe(polyglot.CUSTOMPARAMS, self.parameter_handler)
+        self.poly.subscribe(polyglot.CUSTOMDATA, self.data_handler)
+        self.poly.subscribe(polyglot.POLL, self.poll)
+        self.poly.subscribe(polyglot.STOP, self.stop)
+        self.poly.ready()
+        self.poly.addNode(self)
 
     def start(self):
         LOGGER.info('Starting LiFX Polyglot v2 NodeServer version {}, LiFX LAN: {}'.format(VERSION, lifxlan.__version__))
-        if 'change_no_pon' in self.polyConfig['customParams']:
+        polyglot.updateProfile()
+        self.poly.setCustomParamsDoc()
+
+    def parameter_handler(self, params):
+        self.parameters.load(params)
+        self.poly.Notices.clear()
+        if self.parameters['change_no_pon']:
             LOGGER.debug('Change of color won\'t power bulbs on')
             self.change_pon = False
-        if 'ignore_second_on' in self.polyConfig['customParams']:
+        if self.parameters['ignore_second_on']:
             LOGGER.debug('DON will be ignored if already on')
             self.ignore_second_on = True
-        self._checkProfile()
         self.discover()
         LOGGER.debug('Start complete')
+
+    def data_handler(self, data):
+        self.cust_data.load(data)
 
     def stop(self):
         LOGGER.info('Stopping LiFX Polyglot v2 NodeServer version {}'.format(VERSION))
 
-    def _checkProfile(self):
-        profile_version_file = Path('profile/version.txt')
-        if profile_version_file.is_file() and 'customData' in self.polyConfig:
-            with profile_version_file.open() as f:
-                profile_version = f.read().replace('\n', '')
-                f.close()
-            if 'prof_ver' in self.polyConfig['customData']:
-                if self.polyConfig['customData']['prof_ver'] != profile_version:
-                    self.update_nodes = True
-            else:
-                self.update_nodes = True
-            if self.update_nodes:
-                LOGGER.info('New Profile Version detected: {}, all nodes will be updated'.format(profile_version))
-                cust_data = deepcopy(self.polyConfig['customData'])
-                cust_data['prof_ver'] = profile_version
-                self.saveCustomData(cust_data)
-                self.updateNode(self)
-
-    def shortPoll(self):
+    def poll(self, polltype):
         if self.discovery_thread is not None:
             if self.discovery_thread.is_alive():
-                LOGGER.debug('Skipping shortPoll() while discovery in progress...')
+                LOGGER.debug('Skipping poll() while discovery in progress...')
                 return
             else:
                 self.discovery_thread = None
-        for node in self.nodes:
-            self.nodes[node].update()
-
-    def longPoll(self):
-        if self.discovery_thread is not None:
-            if self.discovery_thread.is_alive():
-                LOGGER.debug('Skipping longPoll() while discovery in progress...')
-                return
+        for node in self.poly.getNodes().values():
+            if polltype == 'shortPoll':
+                node.update()
             else:
-                self.discovery_thread = None
-        for node in self.nodes:
-            self.nodes[node].long_update()
+                node.long_update()
 
     def update(self):
         pass
@@ -132,19 +124,19 @@ class Controller(polyinterface.Controller):
 
     def _manual_discovery(self):
         try:
-            f = open(self.polyConfig['customParams']['devlist'])
+            f = open(self.parameters['devlist'])
         except Exception as ex:
-            LOGGER.error('Failed to open {}: {}'.format(self.polyConfig['customParams']['devlist'], ex))
+            LOGGER.error('Failed to open {}: {}'.format(self.paramaters['devlist'], ex))
             return False
         try:
             data = yaml.safe_load(f.read())
             f.close()
         except Exception as ex:
-            LOGGER.error('Failed to parse {} content: {}'.format(self.polyConfig['customParams']['devlist'], ex))
+            LOGGER.error('Failed to parse {} content: {}'.format(self.parameters['devlist'], ex))
             return False
 
         if 'bulbs' not in data:
-            LOGGER.error('Manual discovery file {} is missing bulbs section'.format(self.polyConfig['customParams']['devlist']))
+            LOGGER.error('Manual discovery file {} is missing bulbs section'.format(self.parameters['devlist']))
             return False
 
         for b in data['bulbs']:
@@ -152,32 +144,32 @@ class Controller(polyinterface.Controller):
             address = b['mac'].replace(':', '').lower()
             mac = b['mac']
             ip = b['ip']
-            if not address in self.nodes:
+            if not self.poly.getNode(address):
                 self.bulbs_found += 1
                 if b['type'] == 'multizone':
                     d = lifxlan.MultiZoneLight(mac, ip)
                     ''' Save object reference if we need it for group membership '''
                     b['object'] = d
                     LOGGER.info('Found MultiZone Bulb: {}({})'.format(name, address))
-                    self.addNode(MultiZone(self, self.address, address, name, d), update = self.update_nodes)
+                    self.poly.addNode(MultiZone(self.poly, self.address, address, name, d))
                 elif b['type'] == 'bulb':
                     d = lifxlan.Light(mac, ip)
                     ''' Save object reference if we need it for group membership '''
                     b['object'] = d
                     LOGGER.info('Found Bulb: {}({})'.format(name, address))
-                    self.addNode(Light(self, self.address, address, name, d), update = self.update_nodes)
+                    self.poly.addNode(Light(self.poly, self.address, address, name, d))
                 elif b['type'] == 'tile':
                     d = lifxlan.TileChain(mac, ip)
                     ''' Save object reference if we need it for group membership '''
                     b['object'] = d
                     LOGGER.info('Found Tile: {}({})'.format(name, address))
-                    self.addNode(Tile(self, self.address, address, name, d), update = self.update_nodes)
+                    self.poly.addNode(Tile(self.poly, self.address, address, name, d))
                 else:
                     LOGGER.error('Unknown type: {}'.format(b['type']))
         self.setDriver('GV0', self.bulbs_found)
 
         if 'groups' not in data:
-            LOGGER.info('Manual discovery file {} is missing groups section'.format(self.polyConfig['customParams']['devlist']))
+            LOGGER.info('Manual discovery file {} is missing groups section'.format(self.parameters['devlist']))
             return True
 
         for grp in data['groups']:
@@ -195,15 +187,15 @@ class Controller(polyinterface.Controller):
             if len(members) > 0:
                 gaddress = grp['address']
                 glabel = grp['name']
-                if not gaddress in self.nodes:
+                if not self.poly.getNode(gaddress):
                     LOGGER.info('Found LiFX Group: {}'.format(glabel))
                     grp = lifxlan.Group(members)
-                    self.addNode(Group(self, self.address, gaddress, glabel, grp), update = self.update_nodes)
+                    self.poly.addNode(Group(self.poly, self.address, gaddress, glabel, grp))
         return True
 
     def _discovery_process(self):
         LOGGER.info('Starting LiFX Discovery thread...')
-        if 'devlist' in self.polyConfig['customParams']:
+        if self.parameters['devlist']:
             LOGGER.info('Attempting manual discovery...')
             if self._manual_discovery():
                 LOGGER.info('Manual discovery is complete')
@@ -217,19 +209,19 @@ class Controller(polyinterface.Controller):
                 label = str(d.get_label())
                 name = 'LIFX {}'.format(label)
                 address = d.get_mac_addr().replace(':', '').lower()
-                if not address in self.nodes:
+                if not self.poly.getNode(address):
                     self.bulbs_found += 1
                     if d.supports_multizone():
                         LOGGER.info('Found MultiZone Bulb: {}({})'.format(name, address))
-                        self.addNode(MultiZone(self, self.address, address, name, d), update = self.update_nodes)
+                        self.poly.addNode(MultiZone(self.poly, self.address, address, name, d))
                     else:
                         LOGGER.info('Found Bulb: {}({})'.format(name, address))
-                        self.addNode(Light(self, self.address, address, name, d), update = self.update_nodes)
+                        self.poly.addNode(Light(self.poly, self.address, address, name, d))
                 gid, glabel, gupdatedat = d.get_group_tuple()
                 gaddress = glabel.replace("'", "").replace(' ', '').lower()[:12]
-                if not gaddress in self.nodes:
+                if not self.poly.getNode(gaddress):
                     LOGGER.info('Found LiFX Group: {}'.format(glabel))
-                    self.addNode(Group(self, self.address, gaddress, glabel), update = self.update_nodes)
+                    self.poly.addNode(Group(self.poly, self.address, gaddress, glabel))
         except (lifxlan.WorkflowException, OSError, IOError, TypeError) as ex:
             LOGGER.error('discovery Error: {}'.format(ex))
         self.update_nodes = False
@@ -305,12 +297,13 @@ class Controller(polyinterface.Controller):
                }
 
 
-class Light(polyinterface.Node):
+class Light(udi_interface.Node):
     """
     LiFX Light Parent Class
     """
-    def __init__(self, controller, primary, address, name, dev):
-        super().__init__(controller, primary, address, name)
+    def __init__(self, polyglot, primary, address, name, dev):
+        super().__init__(polyglot, primary, address, name)
+        self.controller = self.poly.getNode(self.primary)
         self.device = dev
         self.name = name
         self.power = False
@@ -673,8 +666,8 @@ class Light(polyinterface.Node):
                 }
 
 class MultiZone(Light):
-    def __init__(self, controller, primary, address, name, dev):
-        super().__init__(controller, primary, address, name, dev)
+    def __init__(self, polyglot, primary, address, name, dev):
+        super().__init__(polyglot, primary, address, name, dev)
         self.num_zones = 0
         self.current_zone = 0
         self.new_color = None
@@ -1045,8 +1038,9 @@ class Tile(Light):
     """
     LiFX Light is a Parent Class
     """
-    def __init__(self, controller, primary, address, name, dev):
-        super().__init__(controller, primary, address, name, dev)
+    def __init__(self, polyglot, primary, address, name, dev):
+        super().__init__(polyglot, primary, address, name, dev)
+        self.controller = self.poly.getNode(self.primary)
         self.tile_count = 0
         self.effect = 0
 
@@ -1074,19 +1068,18 @@ class Tile(Light):
 
     def save_state(self, command):
         mem_index = str(command.get('value'))
-        custom_data = deepcopy(self.controller.polyConfig['customData'])
         try:
             color_array = self.device.get_tilechain_colors()
         except Exception as ex:
             LOGGER.error(f'Failed to retrieve colors for {self.name}: {ex}')
             return
         ''' Create structure for color storage'''
-        if 'saved_tile_colors' not in custom_data:
-            custom_data['saved_tile_colors'] = {}
-        if self.address not in custom_data['saved_tile_colors']:
-            custom_data['saved_tile_colors'][self.address] = {}
-        custom_data['saved_tile_colors'][self.address].update({ mem_index: color_array })
-        self.controller.saveCustomData(custom_data)
+        if 'saved_tile_colors' not in self.controller.cust_data:
+            self.controller.cust_data['saved_tile_colors'] = {}
+        if self.address not in self.controller.cust_data['saved_tile_colors']:
+            self.controller.cust_data['saved_tile_colors'][self.address] = {}
+        self.controller.cust_data['saved_tile_colors'][self.address].update({ mem_index: color_array })
+        LOGGER.info(self.controller.cust_data['saved_tile_colors'])
 
     def recall_state(self, command):
         if self.effect > 0:
@@ -1099,7 +1092,7 @@ class Tile(Light):
             self.setDriver('GV9', self.effect)
         mem_index = str(command.get('value'))
         try:
-            color_array = self.controller.polyConfig['customData']['saved_tile_colors'][self.address][mem_index]
+            color_array = self.controller.cust_data['saved_tile_colors'][self.address][mem_index]
         except Exception as ex:
             LOGGER.error(f'Failed to retrieve saved tile colors {mem_index} for {self.name}: {ex}')
             return
@@ -1162,13 +1155,14 @@ class Tile(Light):
                 }
 
 
-class Group(polyinterface.Node):
+class Group(udi_interface.Node):
     """
     LiFX Group Node Class
     """
-    def __init__(self, controller, primary, address, label, grp=None):
+    def __init__(self, polyglot, primary, address, label, grp=None):
         self.label = label.replace("'", "")
-        super().__init__(controller, primary, address, 'LIFX Group ' + str(label))
+        super().__init__(polyglot, primary, address, 'LIFX Group ' + str(label))
+        self.controller = self.poly.getNode(self.primary)
         self.lifxLabel = label
         if grp:
             self.lifxGroup = grp
@@ -1305,9 +1299,9 @@ class Group(polyinterface.Node):
 
 if __name__ == "__main__":
     try:
-        polyglot = polyinterface.Interface('LiFX')
+        polyglot = udi_interface.Interface('LiFX')
         polyglot.start()
-        control = Controller(polyglot)
-        control.runForever()
+        Controller(polyglot, 'lifxctl', 'lifxctl', 'LiFX')
+        polyglot.runForever()
     except (KeyboardInterrupt, SystemExit):
         sys.exit(0)
