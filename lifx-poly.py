@@ -19,7 +19,7 @@ import math
 LOGGER = udi_interface.LOGGER
 Custom = udi_interface.Custom
 BR_INCREMENT = 2620    # this is ~4% of 65535
-BR_MIN = 1310          # minimum brightness value ~2%
+BR_MIN = 335          # minimum brightness value ~2%
 BR_MAX = 65535         # maximum brightness value
 FADE_INTERVAL = 5000   # 5s
 BRTDIM_INTERVAL = 400  # 400ms
